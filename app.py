@@ -877,23 +877,37 @@ def find_empty_stamp_position(page, circular_number: str, fontsize: float = 9.5)
 
 
 def stamp_pdf(pdf_bytes: bytes, circular_number: str) -> bytes:
-    """Stamp the circular number horizontally in a clean empty place near the top."""
+    """Stamp the circular number horizontally in a clean empty place near the top.
+
+    This version is page-rotation aware. Some scanned PDFs are internally stored
+    with 90/180/270-degree page rotation, which previously caused a horizontal
+    stamp to appear vertically down the side.
+    """
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     page = doc[0]
 
     fontsize = 9.5
-    x, y = find_empty_stamp_position(
+
+    # find_empty_stamp_position works in the visible / rotated page coordinate space.
+    visible_x, visible_y = find_empty_stamp_position(
         page,
         circular_number=circular_number,
         fontsize=fontsize,
     )
 
+    # Convert the desired visible position back to the PDF's unrotated coordinate
+    # system, then rotate the inserted text by the page's own rotation so it
+    # appears horizontal to the reader.
+    visible_point = fitz.Point(visible_x, visible_y)
+    insert_point = visible_point * page.derotation_matrix
+
     page.insert_text(
-        fitz.Point(x, y),
+        insert_point,
         circular_number,
         fontsize=fontsize,
         fontname="helv",
         color=BLUE,
+        rotate=page.rotation,
         overlay=True,
     )
 
