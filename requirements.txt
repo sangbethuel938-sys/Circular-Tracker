@@ -1,7 +1,8 @@
-streamlit>=1.39,<2
-PyMuPDF>=1.24
-pandas>=2.1
-openpyxl>=3.1
-requests>=2.31
-Pillow>=10.0
-pytesseract>=0.3.13
+streamlit==1.64.0
+PyMuPDF==1.28.2
+pandas==2.3.3
+python-dateutil==2.9.0.post0
+openpyxl==3.1.5
+requests==2.34.2
+Pillow==12.3.0
+pytesseract==0.3.13
