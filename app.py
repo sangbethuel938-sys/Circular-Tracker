@@ -4,6 +4,7 @@ import io
 import os
 import re
 import sqlite3
+import shutil
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
@@ -12,7 +13,7 @@ import fitz  # PyMuPDF
 import pandas as pd
 import requests
 import streamlit as st
-from PIL import Image
+from PIL import Image, ImageOps, ImageFilter
 
 try:
     import pytesseract
@@ -150,27 +151,90 @@ def read_pdf_text(pdf_bytes: bytes) -> str:
     return text
 
 
-def ocr_image(image: Image.Image) -> str:
+def configure_tesseract() -> tuple[bool, str]:
+    """Locate and configure the Tesseract executable.
+
+    Works on Streamlit Cloud/Linux and common Windows installs.
+    Returns (available, diagnostic_message).
+    """
     if pytesseract is None:
+        return False, "pytesseract Python package is not installed."
+
+    candidates = [
+        shutil.which("tesseract"),
+        "/usr/bin/tesseract",
+        "/usr/local/bin/tesseract",
+        r"C:\\Program Files\\Tesseract-OCR\\tesseract.exe",
+        r"C:\\Program Files (x86)\\Tesseract-OCR\\tesseract.exe",
+    ]
+
+    for candidate in candidates:
+        if candidate and Path(candidate).exists():
+            pytesseract.pytesseract.tesseract_cmd = str(candidate)
+            return True, f"Tesseract found at {candidate}"
+
+    return False, "Tesseract executable was not found."
+
+
+def preprocess_for_ocr(image: Image.Image) -> Image.Image:
+    """Improve scanned-document readability before OCR."""
+    img = image.convert("L")
+    img = ImageOps.autocontrast(img)
+
+    # Upscale smaller scans so Tesseract has enough pixel detail.
+    if img.width < 1800:
+        scale = max(1.0, 1800 / max(img.width, 1))
+        img = img.resize(
+            (int(img.width * scale), int(img.height * scale)),
+            Image.Resampling.LANCZOS,
+        )
+
+    img = img.filter(ImageFilter.SHARPEN)
+    return img
+
+
+def ocr_image(image: Image.Image) -> str:
+    available, _ = configure_tesseract()
+    if not available:
         return ""
+
     try:
-        return pytesseract.image_to_string(image)
+        prepared = preprocess_for_ocr(image)
+
+        # PSM 6 is reliable for letter/circular layouts with blocks of text.
+        text = pytesseract.image_to_string(
+            prepared,
+            lang="eng",
+            config="--oem 3 --psm 6",
+        )
+        return text.strip()
     except Exception:
         return ""
 
 
 def ocr_pdf(pdf_bytes: bytes) -> str:
-    if pytesseract is None:
+    available, _ = configure_tesseract()
+    if not available:
         return ""
+
     try:
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
         chunks = []
+
+        # 3x rendering gives OCR a much clearer image than 2x on scans.
         for page in doc:
-            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
-            img = Image.open(io.BytesIO(pix.tobytes("png")))
-            chunks.append(ocr_image(img))
+            pix = page.get_pixmap(
+                matrix=fitz.Matrix(3, 3),
+                alpha=False,
+            )
+            img = Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
+            page_text = ocr_image(img)
+            if page_text:
+                chunks.append(page_text)
+
         doc.close()
-        return "\n".join(chunks).strip()
+        return "\n\n".join(chunks).strip()
+
     except Exception:
         return ""
 
@@ -178,11 +242,18 @@ def ocr_pdf(pdf_bytes: bytes) -> str:
 def extract_text(uploaded) -> str:
     data = uploaded.getvalue()
     ext = Path(uploaded.name).suffix.lower()
+
     if ext == ".pdf":
-        text = read_pdf_text(data)
-        if len(re.sub(r"\s+", "", text)) >= 80:
-            return text
-        return ocr_pdf(data)
+        native_text = read_pdf_text(data)
+
+        # If the PDF already contains a useful text layer, use it.
+        if len(re.sub(r"\s+", "", native_text)) >= 80:
+            return native_text
+
+        # Otherwise treat it as an image-only / scanned PDF.
+        ocr_text = ocr_pdf(data)
+        return ocr_text or native_text
+
     img = Image.open(io.BytesIO(data)).convert("RGB")
     return ocr_image(img)
 
@@ -367,18 +438,21 @@ def stamp_pdf(pdf_bytes: bytes, circular_number: str) -> bytes:
     x_right = page.rect.width - 48
     x_left = max(page.rect.width * 0.55, x_right - 250)
 
-    # Dynamically find the green header line and place the number BELOW it.
+    # Dynamically find the EATTA green header line.
     detected_line_y = detect_green_header_line_y(page)
 
     if detected_line_y is not None:
+        # EATTA circular format: place the number just BELOW the green line.
         y_top = detected_line_y + 6
     else:
-        # Safe fallback for documents where the line cannot be detected.
-        y_top = page.rect.height * 0.155
+        # Other document formats: place the number in a CLEAN top-right area.
+        # Keep clear of the page edge and normal header text.
+        y_top = 28
 
-    # Keep the stamp in a sensible upper-page area.
-    y_top = max(page.rect.height * 0.10, min(y_top, page.rect.height * 0.28))
-    y_bottom = y_top + 18
+    # Use a wide horizontal box so the full circular number stays on one line.
+    x_right = page.rect.width - 36
+    x_left = max(page.rect.width * 0.52, x_right - 300)
+    y_bottom = y_top + 20
 
     rect = fitz.Rect(
         x_left,
@@ -446,6 +520,14 @@ with st.sidebar:
         except Exception as e:
             st.error(f"Connection failed: {e}")
 
+    st.subheader("OCR")
+    ocr_ready, ocr_message = configure_tesseract()
+    if ocr_ready:
+        st.success("OCR ready")
+    else:
+        st.warning("OCR unavailable")
+        st.caption(ocr_message)
+
     st.divider()
 
     st.subheader("Circular numbering")
@@ -498,7 +580,17 @@ with create_tab:
         if text:
             st.success("Text was read from the circular. Check the details below before saving.")
         else:
-            st.warning("No readable text was detected. Enter the fields manually. For image-only scans, install Tesseract OCR as described in README.md.")
+            ocr_ready, ocr_message = configure_tesseract()
+            if ocr_ready:
+                st.warning(
+                    "No readable text was detected from this scan. "
+                    "Try a clearer/higher-resolution scan or enter the fields manually."
+                )
+            else:
+                st.error(
+                    "OCR is not available on this deployment. "
+                    f"{ocr_message} Check packages.txt and requirements.txt."
+                )
 
         c1, c2 = st.columns(2)
         with c1:
