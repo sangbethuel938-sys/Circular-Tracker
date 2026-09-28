@@ -302,18 +302,90 @@ def uploaded_to_pdf(uploaded) -> bytes:
     return buf.getvalue()
 
 
+def detect_green_header_line_y(page) -> float | None:
+    """Detect the long green horizontal line in the upper part of the page.
+
+    Returns the line position in PDF points, or None if no reliable line is found.
+    This lets the circular number sit just below the actual letterhead line even
+    when a scan is slightly shifted, resized, or cropped.
+    """
+    try:
+        # Only inspect the upper 35% of page; render at 2x for reliable detection.
+        clip = fitz.Rect(
+            0,
+            0,
+            page.rect.width,
+            page.rect.height * 0.35,
+        )
+        matrix = fitz.Matrix(2, 2)
+        pix = page.get_pixmap(matrix=matrix, clip=clip, alpha=False)
+
+        img = Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
+        width, height = img.size
+        pixels = img.load()
+
+        best_row = None
+        best_count = 0
+
+        # Ignore the extreme top edge and scan for a green-dominant horizontal row.
+        for y in range(max(2, int(height * 0.05)), height - 2):
+            count = 0
+
+            # Sample every second pixel for speed.
+            for x in range(0, width, 2):
+                r, g, b = pixels[x, y]
+
+                # Broad EATTA-green detector. Designed to tolerate scan variation.
+                if (
+                    g >= 65
+                    and g > r * 1.18
+                    and g > b * 1.12
+                    and (g - r) >= 18
+                ):
+                    count += 1
+
+            if count > best_count:
+                best_count = count
+                best_row = y
+
+        # Require a reasonably long line. Text alone should not meet this threshold.
+        sampled_width = max(1, width // 2)
+        if best_row is None or best_count < sampled_width * 0.22:
+            return None
+
+        # Convert rendered pixel Y back into PDF-point coordinates.
+        return clip.y0 + (best_row / 2.0)
+
+    except Exception:
+        return None
+
+
 def stamp_pdf(pdf_bytes: bytes, circular_number: str) -> bytes:
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     page = doc[0]
 
-    # Designed around the supplied EATTA letterhead: below contact/header block,
-    # above "Circular to Members", right aligned.
-    # Uses page-relative coordinates so it also behaves well on A4/Letter scans.
     x_right = page.rect.width - 48
     x_left = max(page.rect.width * 0.55, x_right - 250)
-    y_top = page.rect.height * 0.145
+
+    # Dynamically find the green header line and place the number BELOW it.
+    detected_line_y = detect_green_header_line_y(page)
+
+    if detected_line_y is not None:
+        y_top = detected_line_y + 6
+    else:
+        # Safe fallback for documents where the line cannot be detected.
+        y_top = page.rect.height * 0.155
+
+    # Keep the stamp in a sensible upper-page area.
+    y_top = max(page.rect.height * 0.10, min(y_top, page.rect.height * 0.28))
     y_bottom = y_top + 18
-    rect = fitz.Rect(x_left, y_top, x_right, y_bottom)
+
+    rect = fitz.Rect(
+        x_left,
+        y_top,
+        x_right,
+        y_bottom,
+    )
 
     page.insert_textbox(
         rect,
@@ -324,6 +396,7 @@ def stamp_pdf(pdf_bytes: bytes, circular_number: str) -> bytes:
         align=fitz.TEXT_ALIGN_RIGHT,
         overlay=True,
     )
+
     out = doc.tobytes(garbage=4, deflate=True)
     doc.close()
     return out
