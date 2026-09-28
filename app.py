@@ -362,6 +362,66 @@ def parse_fields(text: str) -> dict[str, str]:
     }
 
 
+
+def parse_circular_date(value: str) -> date:
+    """Convert extracted circular dates to a standard Python date.
+
+    Handles examples such as:
+    - 26th August 2021
+    - 26 August 2021
+    - 26/08/2021
+    - 2021-08-26
+
+    Falls back to today's date when OCR cannot confidently parse the value.
+    """
+    if not value:
+        return date.today()
+
+    text = clean_line(value)
+
+    # Remove ordinal suffixes: 1st, 2nd, 3rd, 4th...
+    text = re.sub(r"(?i)(\d{1,2})(st|nd|rd|th)\b", r"\1", text)
+
+    formats = [
+        "%d %B %Y",
+        "%d %b %Y",
+        "%d/%m/%Y",
+        "%d-%m-%Y",
+        "%Y-%m-%d",
+        "%Y/%m/%d",
+        "%m/%d/%Y",
+    ]
+
+    for fmt in formats:
+        try:
+            return datetime.strptime(text, fmt).date()
+        except ValueError:
+            pass
+
+    # Try to find a date-like part inside longer OCR text.
+    patterns = [
+        r"\b\d{1,2}\s+[A-Za-z]+\s+\d{4}\b",
+        r"\b\d{1,2}[/-]\d{1,2}[/-]\d{4}\b",
+        r"\b\d{4}[/-]\d{1,2}[/-]\d{1,2}\b",
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            candidate = match.group(0)
+            for fmt in formats:
+                try:
+                    return datetime.strptime(candidate, fmt).date()
+                except ValueError:
+                    pass
+
+    return date.today()
+
+
+def format_circular_date(value: date) -> str:
+    """Store/display circular dates in standard DD/MM/YYYY format."""
+    return value.strftime("%d/%m/%Y")
+
 def uploaded_to_pdf(uploaded) -> bytes:
     data = uploaded.getvalue()
     ext = Path(uploaded.name).suffix.lower()
@@ -432,42 +492,53 @@ def detect_green_header_line_y(page) -> float | None:
 
 
 def stamp_pdf(pdf_bytes: bytes, circular_number: str) -> bytes:
+    """Stamp the circular number horizontally at the top of page 1.
+
+    - EATTA circulars: place it just below the detected green header line.
+    - Other formats: place it in a clean top-right position.
+    - The text is inserted as a single line, so it cannot wrap vertically.
+    """
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     page = doc[0]
 
-    x_right = page.rect.width - 48
-    x_left = max(page.rect.width * 0.55, x_right - 250)
+    fontsize = 9.5
+    right_margin = 36
+    top_margin = 28
 
-    # Dynamically find the EATTA green header line.
     detected_line_y = detect_green_header_line_y(page)
 
-    if detected_line_y is not None:
-        # EATTA circular format: place the number just BELOW the green line.
-        y_top = detected_line_y + 6
+    # Only accept a green line if it appears in a plausible letterhead band.
+    # This reduces false detections on unrelated documents.
+    min_header_y = page.rect.height * 0.06
+    max_header_y = page.rect.height * 0.22
+
+    if (
+        detected_line_y is not None
+        and min_header_y <= detected_line_y <= max_header_y
+    ):
+        # Baseline just below the green line.
+        y = detected_line_y + 15
     else:
-        # Other document formats: place the number in a CLEAN top-right area.
-        # Keep clear of the page edge and normal header text.
-        y_top = 28
+        # Generic document: clean top position.
+        y = top_margin
 
-    # Use a wide horizontal box so the full circular number stays on one line.
-    x_right = page.rect.width - 36
-    x_left = max(page.rect.width * 0.52, x_right - 300)
-    y_bottom = y_top + 20
-
-    rect = fitz.Rect(
-        x_left,
-        y_top,
-        x_right,
-        y_bottom,
+    # Calculate text width and position it horizontally at the top-right.
+    text_width = fitz.get_text_length(
+        circular_number,
+        fontname="helv",
+        fontsize=fontsize,
+    )
+    x = max(
+        36,
+        page.rect.width - right_margin - text_width,
     )
 
-    page.insert_textbox(
-        rect,
+    page.insert_text(
+        fitz.Point(x, y),
         circular_number,
-        fontsize=9.5,
+        fontsize=fontsize,
         fontname="helv",
         color=BLUE,
-        align=fitz.TEXT_ALIGN_RIGHT,
         overlay=True,
     )
 
@@ -578,7 +649,10 @@ with create_tab:
         text = st.session_state.get("extracted_text", "")
 
         if text:
-            st.success("Text was read from the circular. Check the details below before saving.")
+            st.success(
+                "Text was read from the circular and the fields below were auto-filled. "
+                "Review and correct anything before saving."
+            )
         else:
             ocr_ready, ocr_message = configure_tesseract()
             if ocr_ready:
@@ -594,13 +668,36 @@ with create_tab:
 
         c1, c2 = st.columns(2)
         with c1:
-            circular_date = st.text_input("Circular date", value=parsed.get("date", ""), placeholder="e.g. 28th September 2026")
-            sender = st.text_input("From", value=parsed.get("from", ""))
-        with c2:
-            recipient = st.text_area("To", value=parsed.get("to", ""), height=90)
-            status = st.selectbox("Status", ["Issued", "Draft"])
+            detected_date = parse_circular_date(parsed.get("date", ""))
+            selected_date = st.date_input(
+                "Circular date",
+                value=detected_date,
+                format="DD/MM/YYYY",
+                help="Select or correct the circular date. It will be saved as DD/MM/YYYY.",
+            )
+            circular_date = format_circular_date(selected_date)
 
-        subject = st.text_area("Subject / RE", value=parsed.get("subject", ""), height=90)
+            sender = st.text_input(
+                "From",
+                value=parsed.get("from", ""),
+            )
+
+        with c2:
+            recipient = st.text_area(
+                "To",
+                value=parsed.get("to", ""),
+                height=90,
+            )
+            status = st.selectbox(
+                "Status",
+                ["Issued", "Draft"],
+            )
+
+        subject = st.text_area(
+            "Subject / RE",
+            value=parsed.get("subject", ""),
+            height=90,
+        )
         remarks = st.text_input("Remarks", value="")
 
         if not st.session_state.get("reserved_number"):
