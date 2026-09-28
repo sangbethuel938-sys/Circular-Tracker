@@ -128,7 +128,7 @@ def export_excel() -> None:
             SELECT serial_no AS 'Serial No.', circular_number AS 'Circular Number',
                    date AS 'Date', subject AS 'Subject', recipient AS 'To', sender AS 'From',
                    status AS 'Status', file_name AS 'File Name',
-                   local_file_path AS 'Local File Path', date_recorded AS 'Date Recorded',
+                   date_recorded AS 'Date Recorded',
                    remarks AS 'Remarks'
             FROM circulars ORDER BY id DESC
             """,
@@ -144,7 +144,7 @@ def local_records() -> pd.DataFrame:
             SELECT serial_no AS 'Serial No.', circular_number AS 'Circular Number',
                    date AS 'Date', subject AS 'Subject', recipient AS 'To', sender AS 'From',
                    status AS 'Status', file_name AS 'File Name',
-                   local_file_path AS 'Local File Path', date_recorded AS 'Date Recorded',
+                   date_recorded AS 'Date Recorded',
                    remarks AS 'Remarks'
             FROM circulars ORDER BY id DESC
             """,
@@ -916,16 +916,74 @@ def stamp_pdf(pdf_bytes: bytes, circular_number: str) -> bytes:
     return out
 
 
-def safe_name(number: str) -> str:
-    return number.replace("/", "_") + ".pdf"
+def safe_filename_from_heading(
+    heading: str,
+    circular_number: str,
+) -> str:
+    """Create a safe PDF filename from the circular heading/subject.
+
+    Examples:
+      COLLECTION OF TEA SAMPLES FOR ANALYSIS.pdf
+      COLLECTION OF TEA SAMPLES FOR ANALYSIS - AM1.pdf
+
+    Invalid Windows/Linux filename characters are removed.
+    """
+    heading = clean_line(heading or "").strip()
+
+    # Fallback only when no heading/subject is available.
+    if not heading:
+        heading = circular_number.replace("/", "_")
+
+    # Remove HTML/OCR artifacts that may appear in extracted headings.
+    heading = re.sub(r"(?i)<br\s*/?>", " ", heading)
+    heading = re.sub(r"\s+", " ", heading).strip()
+
+    # Remove characters that are invalid or unsafe in filenames.
+    heading = re.sub(r'[<>:"/\\\\|?*]', "", heading)
+    heading = heading.strip(" .-_")
+
+    # Keep filenames practical for Windows and cloud file systems.
+    if len(heading) > 140:
+        heading = heading[:140].rstrip(" .-_")
+
+    # Add amendment suffix so amendments never overwrite the original file.
+    amendment_match = re.search(r"/AM(\d+)$", circular_number, flags=re.I)
+
+    if amendment_match:
+        heading = f"{heading} - AM{amendment_match.group(1)}"
+
+    return f"{heading}.pdf"
 
 
-def save_pdf(pdf_bytes: bytes, circular_number: str) -> Path:
+def save_pdf(
+    pdf_bytes: bytes,
+    circular_number: str,
+    heading: str,
+) -> Path:
     year_match = re.search(r"/(\d{4})/", circular_number)
     year = year_match.group(1) if year_match else str(datetime.now().year)
+
     folder = CIRCULARS_DIR / year
     folder.mkdir(parents=True, exist_ok=True)
-    path = folder / safe_name(circular_number)
+
+    file_name = safe_filename_from_heading(
+        heading=heading,
+        circular_number=circular_number,
+    )
+
+    path = folder / file_name
+
+    # If a file with the same heading already exists, preserve both rather
+    # than silently overwriting an earlier circular.
+    if path.exists():
+        stem = path.stem
+        suffix = path.suffix
+        counter = 2
+
+        while path.exists():
+            path = folder / f"{stem} ({counter}){suffix}"
+            counter += 1
+
     path.write_bytes(pdf_bytes)
     return path
 
@@ -1152,7 +1210,7 @@ with create_tab:
                 try:
                     pdf_bytes = uploaded_to_pdf(uploaded)
                     stamped = stamp_pdf(pdf_bytes, number)
-                    saved_path = save_pdf(stamped, number)
+                    saved_path = save_pdf(stamped, number, subject)
                     recorded_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
                     record = {
@@ -1187,7 +1245,6 @@ with create_tab:
                         **{"from": sender},
                         status=status,
                         file_name=saved_path.name,
-                        local_file_path=str(saved_path),
                         remarks=remarks,
                         document_type=reserved_type,
                         original_circular=reserved_original if reserved_type == "Amendment" else number,
@@ -1241,7 +1298,6 @@ with register_tab:
                     "from": "From",
                     "status": "Status",
                     "file_name": "File Name",
-                    "local_file_path": "Local File Path",
                     "date_recorded": "Date Recorded",
                     "remarks": "Remarks",
                     "latest_amendment": "Latest Amendment",
@@ -1262,7 +1318,6 @@ with register_tab:
                     "from": "From",
                     "status": "Status",
                     "file_name": "File Name",
-                    "local_file_path": "Local File Path",
                     "date_recorded": "Date Recorded",
                     "amendment_reason": "Amendment Reason",
                     "remarks": "Remarks",
