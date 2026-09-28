@@ -32,7 +32,7 @@ for p in (DATA_DIR, CIRCULARS_DIR, REPORTS_DIR):
 
 st.set_page_config(page_title="EATTA Circular Register", page_icon="📄", layout="wide")
 
-GREEN = (0.05, 0.45, 0.22)  # PDF RGB, close to EATTA green
+BLUE = (0.0, 0.35, 0.75)  # PDF RGB blue for circular number
 
 
 def init_db() -> None:
@@ -133,7 +133,7 @@ def api_call(action: str, **kwargs) -> dict[str, Any]:
     url = get_secret("APPS_SCRIPT_URL")
     secret = get_secret("APPS_SCRIPT_SECRET")
     if not url or not secret:
-        raise RuntimeError("Google Sheets connection is not configured. See README.md.")
+        raise RuntimeError("Google Sheets connection is not configured. Add APPS_SCRIPT_URL and APPS_SCRIPT_SECRET in Streamlit Secrets.")
     payload = {"action": action, "secret": secret, **kwargs}
     r = requests.post(url, json=payload, timeout=30)
     r.raise_for_status()
@@ -194,8 +194,11 @@ def clean_line(s: str) -> str:
 def parse_fields(text: str) -> dict[str, str]:
     """Extract common EATTA circular fields from PDF/OCR text.
 
-    Handles both "From: Secretariat" and layouts where the label and value
-    appear on separate lines, which is common in extracted PDF text.
+    Handles:
+    - To: All Members
+    - Multi-line member association recipient lists
+    - From: Secretariat
+    - Split-line labels produced by PDF extraction/OCR
     """
     lines = [clean_line(x) for x in text.splitlines() if clean_line(x)]
 
@@ -210,10 +213,13 @@ def parse_fields(text: str) -> dict[str, str]:
                 first = clean_line(m.group(1))
                 if first:
                     return first
+
                 vals = []
                 for candidate in lines[i + 1 : i + 1 + max_follow]:
                     low = candidate.lower().rstrip(":")
-                    if low in labels or re.match(r"(?i)^(To|From|Copy to|Date|RE|Subject)\s*:", candidate):
+                    if low in labels or re.match(
+                        r"(?i)^(To|From|Copy to|Date|RE|Subject)\s*:", candidate
+                    ):
                         break
                     vals.append(candidate)
                 return "; ".join(vals)
@@ -223,32 +229,66 @@ def parse_fields(text: str) -> dict[str, str]:
                 vals = []
                 for candidate in lines[i + 1 : i + 1 + max_follow]:
                     low = candidate.lower().rstrip(":")
-                    if low in labels or re.match(r"(?i)^(To|From|Copy to|Date|RE|Subject)\s*:", candidate):
+                    if low in labels or re.match(
+                        r"(?i)^(To|From|Copy to|Date|RE|Subject)\s*:", candidate
+                    ):
                         break
                     vals.append(candidate)
                 return "; ".join(vals)
+
         return ""
 
     raw_date = labelled_value("Date", 1)
     sender = labelled_value("From", 2)
     subject = labelled_value("RE", 2) or labelled_value("Subject", 2)
 
-    # To often spans several association lines until From/Copy to/Date/RE.
+    # Recipient handling:
+    # 1. If the circular explicitly says "All Members", preserve that exact meaning.
+    # 2. Otherwise collect the multi-line To block until the next main label.
     recipient = ""
-    for i, line in enumerate(lines):
-        m = re.match(r"(?i)^To\s*:\s*(.*)$", line)
-        if m or line.lower().rstrip(":") == "to":
-            recipients = []
-            if m and clean_line(m.group(1)):
-                recipients.append(clean_line(m.group(1)))
-            for candidate in lines[i + 1 : i + 8]:
-                if re.match(r"(?i)^(From|Copy to|Date|RE|Subject)\s*:?(?:\s|$)", candidate):
-                    break
-                recipients.append(candidate)
-            recipient = "; ".join(dict.fromkeys(x for x in recipients if x))
-            break
 
-    return {"date": raw_date, "subject": subject, "to": recipient, "from": sender}
+    if re.search(r"(?i)\ball\s+members\b", text):
+        recipient = "All Members"
+    else:
+        for i, line in enumerate(lines):
+            m = re.match(r"(?i)^To\s*:\s*(.*)$", line)
+
+            if m or line.lower().rstrip(":") == "to":
+                recipients = []
+
+                if m:
+                    first = clean_line(m.group(1))
+                    if first:
+                        if re.search(r"(?i)\ball\s+members\b", first):
+                            recipient = "All Members"
+                            break
+                        recipients.append(first)
+
+                for candidate in lines[i + 1 : i + 10]:
+                    if re.match(
+                        r"(?i)^(From|Copy to|Date|RE|Subject)\s*:?(?:\s|$)",
+                        candidate,
+                    ):
+                        break
+
+                    if re.search(r"(?i)\ball\s+members\b", candidate):
+                        recipient = "All Members"
+                        break
+
+                    recipients.append(candidate)
+
+                if not recipient:
+                    recipient = "; ".join(
+                        dict.fromkeys(x for x in recipients if x)
+                    )
+                break
+
+    return {
+        "date": raw_date,
+        "subject": subject,
+        "to": recipient,
+        "from": sender,
+    }
 
 
 def uploaded_to_pdf(uploaded) -> bytes:
@@ -280,7 +320,7 @@ def stamp_pdf(pdf_bytes: bytes, circular_number: str) -> bytes:
         circular_number,
         fontsize=9.5,
         fontname="helv",
-        color=GREEN,
+        color=BLUE,
         align=fitz.TEXT_ALIGN_RIGHT,
         overlay=True,
     )
@@ -309,20 +349,58 @@ st.title("EATTA Circular Register")
 st.caption("Upload a scanned circular → read details → reserve serial in Google Sheets → stamp green number → save locally → update register.")
 
 with st.sidebar:
+    st.header("EATTA Circular Register")
+
+    configured = bool(
+        get_secret("APPS_SCRIPT_URL")
+        and get_secret("APPS_SCRIPT_SECRET")
+    )
+
     st.subheader("Google Sheets")
-    configured = bool(get_secret("APPS_SCRIPT_URL") and get_secret("APPS_SCRIPT_SECRET"))
-    st.success("Configured") if configured else st.warning("Not configured")
-    if configured and st.button("Test connection"):
+    if configured:
+        st.success("Configured")
+    else:
+        st.warning("Not configured")
+
+    if st.button(
+        "Test Google Sheets connection",
+        use_container_width=True,
+        disabled=not configured,
+    ):
         try:
             api_call("health")
-            st.success("Google Sheets connection is working.")
+            st.success("Connection is working.")
         except Exception as e:
-            st.error(str(e))
+            st.error(f"Connection failed: {e}")
+
     st.divider()
-    st.write("**Number format**")
-    st.code("EATTA/CIR/YYYY/001")
-    st.write("**PDF location**")
-    st.code(str(CIRCULARS_DIR))
+
+    st.subheader("Circular numbering")
+    st.caption("Automatic reference format")
+    st.code("EATTA/CIR/YYYY/001", language=None)
+
+    st.subheader("Storage")
+    st.caption("Numbered circular PDFs")
+    st.code(str(CIRCULARS_DIR), language=None)
+
+    st.caption("Local register backup")
+    st.code(str(DB_PATH), language=None)
+
+    st.caption("Excel backup")
+    st.code(str(EXCEL_PATH), language=None)
+
+    st.divider()
+
+    st.subheader("Workflow")
+    st.markdown(
+        """
+        1. Upload circular
+        2. Check extracted details
+        3. Reserve circular number
+        4. Stamp and save PDF
+        5. Update Google Sheet
+        """
+    )
 
 create_tab, register_tab = st.tabs(["Create Circular", "Register"])
 
