@@ -1,0 +1,21 @@
+# Secrets
+.streamlit/secrets.toml
+.env
+
+# Runtime data
+Circulars/**/*.pdf
+Circulars/**/*.png
+Circulars/**/*.jpg
+Circulars/**/*.jpeg
+data/*.db
+Reports/*.xlsx
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# OS
+.DS_Store
+Thumbs.db
