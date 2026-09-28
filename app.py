@@ -292,14 +292,17 @@ def clean_line(s: str) -> str:
 
 
 def parse_fields(text: str) -> dict[str, str]:
-    """Extract common EATTA circular fields from native PDF text or OCR.
+    """Extract fields from both labelled and unlabelled circular/letter formats.
 
-    More tolerant than the earlier parser:
-    - accepts labels with or without colons
-    - handles uppercase/lowercase labels
-    - handles split-line OCR layouts
-    - handles "All Members"
-    - detects RE / Subject lines even when OCR spacing is inconsistent
+    Supports:
+    - EATTA circulars with To / From / Date / RE / Subject labels
+    - "All Members"
+    - Formal letters with address blocks followed by Dear Sir/Madam
+    - Subject headings written in uppercase without a Subject/RE label
+    - Sender details inferred from Yours faithfully/sincerely signature blocks
+    - Dates written as 7th September 2026, 07/09/2026, 2026-09-07, etc.
+
+    The app still presents all extracted values for user review before saving.
     """
     if not text:
         return {"date": "", "subject": "", "to": "", "from": ""}
@@ -307,7 +310,6 @@ def parse_fields(text: str) -> dict[str, str]:
     raw_lines = [x.strip() for x in text.replace("\r", "\n").splitlines()]
     lines = [clean_line(x) for x in raw_lines if clean_line(x)]
 
-    # Normalize common OCR label variants.
     label_re = re.compile(
         r"(?i)^(to|from|copy\s*to|date|re|subject)\s*[:\-]?\s*(.*)$"
     )
@@ -329,20 +331,14 @@ def parse_fields(text: str) -> dict[str, str]:
         if m:
             label = re.sub(r"\s+", " ", m.group(1).lower()).strip()
             value = clean_line(m.group(2))
-
-            if label == "copyto":
-                label = "copy to"
-
             current_label = label
 
             if value:
                 parsed_by_label.setdefault(label, []).append(value)
-
             continue
 
-        # Continue multi-line values only for fields that commonly span lines.
+        # Multi-line recipient blocks are common in EATTA circulars.
         if current_label in {"to", "copy to"}:
-            # Stop if a new implicit field-like line appears.
             if re.match(
                 r"(?i)^(from|date|re|subject|copy\s*to)\b",
                 line,
@@ -352,28 +348,58 @@ def parse_fields(text: str) -> dict[str, str]:
                 parsed_by_label[current_label].append(line)
                 continue
 
+        # Single-line or short continuation values.
         elif current_label in {"from", "date", "re", "subject"}:
-            # Allow one continuation line for OCR-split values.
             if not parsed_by_label[current_label]:
                 parsed_by_label[current_label].append(line)
             current_label = None
 
-    # ---------- TO ----------
+    # ---------------------------------------------------------
+    # DATE
+    # ---------------------------------------------------------
+    date_parts = parsed_by_label.get("date", [])
+    raw_date = clean_line(date_parts[0]) if date_parts else ""
+
+    date_patterns = [
+        r"\b\d{1,2}(?:st|nd|rd|th)?\s+[A-Za-z]+\s+\d{4}\b",
+        r"\b\d{1,2}[/-]\d{1,2}[/-]\d{4}\b",
+        r"\b\d{4}[/-]\d{1,2}[/-]\d{1,2}\b",
+    ]
+
+    # If no labelled date, only inspect the TOP portion of the document first.
+    # This avoids mistaking event dates in the body for the circular date.
+    if not raw_date:
+        top_lines = lines[:10]
+
+        for top_line in top_lines:
+            found = None
+            for pattern in date_patterns:
+                m = re.search(pattern, top_line, flags=re.I)
+                if m:
+                    found = m.group(0)
+                    break
+            if found:
+                raw_date = clean_line(found)
+                break
+
+    # ---------------------------------------------------------
+    # TO / RECIPIENT
+    # ---------------------------------------------------------
     recipient = ""
 
-    # Strong explicit detection anywhere in the text.
     if re.search(r"(?i)\ball\s+members\b", text):
         recipient = "All Members"
     else:
         to_parts = parsed_by_label.get("to", [])
+
         if to_parts:
             cleaned_parts = []
+
             for part in to_parts:
                 part = clean_line(part)
                 if not part:
                     continue
 
-                # Stop if OCR accidentally swallowed later labels into the To block.
                 if re.match(
                     r"(?i)^(from|copy\s*to|date|re|subject)\b",
                     part,
@@ -384,43 +410,61 @@ def parse_fields(text: str) -> dict[str, str]:
 
             recipient = "; ".join(dict.fromkeys(cleaned_parts))
 
-    # ---------- FROM ----------
-    sender_parts = parsed_by_label.get("from", [])
-    sender = clean_line(sender_parts[0]) if sender_parts else ""
+    # Formal-letter fallback:
+    # infer recipient/address block immediately before "Dear Sir/Madam".
+    if not recipient:
+        salutation_index = None
 
-    # Common EATTA fallback.
-    if not sender and re.search(r"(?i)\bsecretariat\b", text):
-        # Only use this fallback when "Secretariat" appears near a From label.
-        m = re.search(
-            r"(?is)\bfrom\s*[:\-]?\s*(?:\n|\s)+([^\n]{1,80})",
-            text,
-        )
-        if m:
-            sender = clean_line(m.group(1))
-
-    # ---------- DATE ----------
-    date_parts = parsed_by_label.get("date", [])
-    raw_date = clean_line(date_parts[0]) if date_parts else ""
-
-    if not raw_date:
-        # Detect common date patterns anywhere in OCR text.
-        date_patterns = [
-            r"\b\d{1,2}(?:st|nd|rd|th)?\s+[A-Za-z]+\s+\d{4}\b",
-            r"\b\d{1,2}[/-]\d{1,2}[/-]\d{4}\b",
-            r"\b\d{4}[/-]\d{1,2}[/-]\d{1,2}\b",
-        ]
-        for pattern in date_patterns:
-            m = re.search(pattern, text, flags=re.I)
-            if m:
-                raw_date = clean_line(m.group(0))
+        for i, line in enumerate(lines):
+            if re.match(
+                r"(?i)^dear\s+(sir|madam|sir/madam|sirs|team|members?)\b",
+                line,
+            ):
+                salutation_index = i
                 break
 
-    # ---------- SUBJECT / RE ----------
+        if salutation_index is not None and salutation_index > 0:
+            start_idx = max(0, salutation_index - 6)
+            candidates = lines[start_idx:salutation_index]
+
+            address_parts = []
+
+            for part in candidates:
+                if re.match(r"(?i)^ref(?:erence)?\s*[:\-]", part):
+                    continue
+
+                if any(re.search(p, part, flags=re.I) for p in date_patterns):
+                    continue
+
+                if re.match(
+                    r"(?i)^(east african tea trade association|tea board of kenya|directors?)$",
+                    part,
+                ):
+                    continue
+
+                # Avoid obvious letterhead/contact lines.
+                if re.search(
+                    r"(?i)(tel:|telephone|mobile|email|e-mail|www\.|p\.?o\.?\s*box\s+\d{5,})",
+                    part,
+                ):
+                    # PO Box can belong to recipient, so retain short address lines.
+                    if not re.match(r"(?i)^p\.?o\.?\s*box", part):
+                        continue
+
+                address_parts.append(part)
+
+            # Prefer the last few lines nearest the salutation.
+            if address_parts:
+                recipient = "; ".join(address_parts[-5:])
+
+    # ---------------------------------------------------------
+    # SUBJECT / RE
+    # ---------------------------------------------------------
     subject_parts = parsed_by_label.get("re", []) or parsed_by_label.get("subject", [])
     subject = clean_line(" ".join(subject_parts)) if subject_parts else ""
 
     if not subject:
-        # Try same-line OCR form: RE ... / SUBJECT ...
+        # Same-line unlabelled OCR variants.
         m = re.search(
             r"(?im)^(?:re|subject)\s*[:\-]?\s+(.+)$",
             text,
@@ -429,25 +473,121 @@ def parse_fields(text: str) -> dict[str, str]:
             subject = clean_line(m.group(1))
 
     if not subject:
-        # Fallback for uppercase title-style subject lines often used in circulars.
-        candidates = []
-        for line in lines:
+        # Look for a title-like uppercase line near the start of the main body.
+        # This handles letters such as "COLLECTION OF TEA SAMPLES FOR ANALYSIS".
+        heading_candidates = []
+
+        for idx, line in enumerate(lines[:30]):
+            if len(line) < 8 or len(line) > 180:
+                continue
+
+            if re.match(
+                r"(?i)^(dear\s+|yours\s+|east african tea trade association|tea board of kenya|directors?)",
+                line,
+            ):
+                continue
+
             letters = re.sub(r"[^A-Za-z]", "", line)
+
             if len(letters) < 8:
                 continue
 
-            upper_letters = sum(1 for c in letters if c.isupper())
-            ratio = upper_letters / max(len(letters), 1)
+            uppercase_ratio = sum(c.isupper() for c in letters) / max(len(letters), 1)
 
-            if ratio >= 0.75 and len(line) <= 180:
-                if not re.match(
-                    r"(?i)^(east african tea trade association|circular to members|directors|to|from|date|copy to)$",
-                    line,
+            # Prefer uppercase headings and lines immediately after salutation.
+            if uppercase_ratio >= 0.72:
+                score = len(line)
+
+                if idx > 0 and re.match(r"(?i)^dear\s+", lines[idx - 1]):
+                    score += 100
+
+                heading_candidates.append((score, line))
+
+        if heading_candidates:
+            subject = max(heading_candidates, key=lambda x: x[0])[1]
+
+    # ---------------------------------------------------------
+    # FROM / SENDER
+    # ---------------------------------------------------------
+    sender_parts = parsed_by_label.get("from", [])
+    sender = clean_line(sender_parts[0]) if sender_parts else ""
+
+    if not sender:
+        # Locate closing/signature block.
+        closing_index = None
+
+        for i, line in enumerate(lines):
+            if re.match(
+                r"(?i)^yours\s+(faithfully|sincerely|truly)\b",
+                line,
+            ):
+                closing_index = i
+                break
+
+        if closing_index is not None:
+            signature_lines = lines[closing_index + 1 : closing_index + 8]
+
+            useful = []
+
+            for part in signature_lines:
+                part = clean_line(part)
+
+                if not part:
+                    continue
+
+                # Ignore obvious signature/scribble OCR noise.
+                alpha = re.sub(r"[^A-Za-z]", "", part)
+                if len(alpha) < 3:
+                    continue
+
+                # Stop when footer/contact section begins.
+                if re.search(
+                    r"(?i)(p\.?o\.?\s*box|telephone|mobile|email|e-mail|www\.|tea house|nyerere avenue)",
+                    part,
                 ):
-                    candidates.append(line)
+                    break
 
-        if candidates:
-            subject = max(candidates, key=len)
+                useful.append(part)
+
+            if useful:
+                # Prefer organization/name/title lines.
+                role_terms = (
+                    "director",
+                    "managing director",
+                    "chief executive officer",
+                    "ceo",
+                    "secretariat",
+                    "manager",
+                    "chairman",
+                    "secretary",
+                )
+
+                selected = []
+
+                for part in useful:
+                    low = part.lower()
+
+                    if (
+                        any(term in low for term in role_terms)
+                        or "association" in low
+                        or "board" in low
+                        or part.isupper()
+                    ):
+                        selected.append(part)
+
+                if not selected:
+                    selected = useful[:3]
+
+                sender = "; ".join(dict.fromkeys(selected[:4]))
+
+    # Specific EATTA fallback if OCR sees Secretariat close to a From marker.
+    if not sender and re.search(r"(?i)\bsecretariat\b", text):
+        m = re.search(
+            r"(?is)\bfrom\s*[:\-]?\s*(?:\n|\s)+([^\n]{1,80})",
+            text,
+        )
+        if m:
+            sender = clean_line(m.group(1))
 
     return {
         "date": raw_date,
@@ -617,46 +757,135 @@ def detect_green_header_line_y(page) -> float | None:
         return None
 
 
-def stamp_pdf(pdf_bytes: bytes, circular_number: str) -> bytes:
-    """Stamp the circular number horizontally at the top of page 1.
 
-    - EATTA circulars: place it just below the detected green header line.
-    - Other formats: place it in a clean top-right position.
-    - The text is inserted as a single line, so it cannot wrap vertically.
+def find_empty_stamp_position(page, circular_number: str, fontsize: float = 9.5) -> tuple[float, float]:
+    """Find a clean empty place near the top of the page for the circular number.
+
+    Strategy:
+    - Render the top portion of the page as an image.
+    - Test several candidate positions across the upper area.
+    - Score each candidate by how much visible content already exists there.
+    - Prefer cleaner areas, while still preferring the top-right/top area.
     """
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    page = doc[0]
-
-    fontsize = 9.5
-    right_margin = 36
-    top_margin = 28
-
-    detected_line_y = detect_green_header_line_y(page)
-
-    # Only accept a green line if it appears in a plausible letterhead band.
-    # This reduces false detections on unrelated documents.
-    min_header_y = page.rect.height * 0.06
-    max_header_y = page.rect.height * 0.22
-
-    if (
-        detected_line_y is not None
-        and min_header_y <= detected_line_y <= max_header_y
-    ):
-        # Baseline just below the green line.
-        y = detected_line_y + 15
-    else:
-        # Generic document: clean top position.
-        y = top_margin
-
-    # Calculate text width and position it horizontally at the top-right.
     text_width = fitz.get_text_length(
         circular_number,
         fontname="helv",
         fontsize=fontsize,
     )
-    x = max(
-        36,
-        page.rect.width - right_margin - text_width,
+
+    box_width = text_width + 12
+    box_height = fontsize + 10
+
+    # Search only the top band of the page.
+    top_band_height = min(page.rect.height * 0.28, 170)
+    clip = fitz.Rect(0, 0, page.rect.width, top_band_height)
+
+    try:
+        scale = 2.0
+        pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), clip=clip, alpha=False)
+        img = Image.open(io.BytesIO(pix.tobytes("png"))).convert("L")
+        width, height = img.size
+        pixels = img.load()
+
+        detected_line_y = None
+        try:
+            detected_line_y = detect_green_header_line_y(page)
+        except Exception:
+            detected_line_y = None
+
+        # Candidate X positions (prefer right side first, but allow center/left if cleaner).
+        x_candidates = []
+        right_margin = 36
+        left_margin = 24
+
+        x_right = page.rect.width - right_margin - box_width
+        x_center = max(left_margin, (page.rect.width - box_width) / 2)
+        x_left = left_margin
+
+        # Add more dense candidates across the upper band
+        fractions = [0.72, 0.58, 0.44, 0.30, 0.16]
+        for frac in fractions:
+            x_candidates.append(max(left_margin, page.rect.width * frac - box_width / 2))
+
+        # Deduplicate while preserving preference order: right, center, custom, left.
+        ordered_x = []
+        for x in [x_right, x_center, *x_candidates, x_left]:
+            x = min(max(left_margin, x), max(left_margin, page.rect.width - box_width - 12))
+            if not any(abs(x - existing) < 3 for existing in ordered_x):
+                ordered_x.append(x)
+
+        # Candidate Y positions.
+        y_candidates = [22, 30, 38, 46, 54, 64, 74, 86, 98, 110]
+
+        # If the green line is detected in a sensible header zone, prioritize just below it.
+        if detected_line_y is not None:
+            if page.rect.height * 0.05 <= detected_line_y <= page.rect.height * 0.22:
+                preferred_y = detected_line_y + 8
+                y_candidates = [preferred_y] + y_candidates
+
+        best = None
+        best_score = None
+
+        for y_pdf in y_candidates:
+            if y_pdf + box_height > top_band_height:
+                continue
+
+            for x_pdf in ordered_x:
+                # Convert the candidate box to rendered-image coordinates.
+                x0 = int(max(0, x_pdf * scale))
+                y0 = int(max(0, y_pdf * scale))
+                x1 = int(min(width, (x_pdf + box_width) * scale))
+                y1 = int(min(height, (y_pdf + box_height) * scale))
+
+                if x1 <= x0 or y1 <= y0:
+                    continue
+
+                total = 0
+                occupied = 0
+
+                # Count darker pixels as occupied content.
+                for yy in range(y0, y1):
+                    for xx in range(x0, x1):
+                        total += 1
+                        if pixels[xx, yy] < 225:
+                            occupied += 1
+
+                occupancy_ratio = occupied / max(total, 1)
+
+                # Preference penalties:
+                # - small penalty for positions lower down
+                # - small penalty for moving left away from the right/top area
+                right_penalty = (page.rect.width - (x_pdf + box_width)) / max(page.rect.width, 1) * 0.02
+                down_penalty = (y_pdf / max(top_band_height, 1)) * 0.03
+
+                score = occupancy_ratio + right_penalty + down_penalty
+
+                if best_score is None or score < best_score:
+                    best_score = score
+                    best = (x_pdf, y_pdf)
+
+        if best is not None:
+            return best
+
+    except Exception:
+        pass
+
+    # Safe fallback
+    fallback_x = max(24, page.rect.width - 36 - box_width)
+    fallback_y = 30
+    return fallback_x, fallback_y
+
+
+def stamp_pdf(pdf_bytes: bytes, circular_number: str) -> bytes:
+    """Stamp the circular number horizontally in a clean empty place near the top."""
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    page = doc[0]
+
+    fontsize = 9.5
+    x, y = find_empty_stamp_position(
+        page,
+        circular_number=circular_number,
+        fontsize=fontsize,
     )
 
     page.insert_text(
