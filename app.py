@@ -53,10 +53,30 @@ def init_db() -> None:
                 local_file_path TEXT,
                 date_recorded TEXT,
                 remarks TEXT,
-                extracted_text TEXT
+                extracted_text TEXT,
+                document_type TEXT DEFAULT 'Original',
+                original_circular TEXT,
+                amendment_no INTEGER,
+                amendment_reason TEXT
             )
             """
         )
+
+        existing = {
+            row[1]
+            for row in con.execute("PRAGMA table_info(circulars)").fetchall()
+        }
+        migrations = {
+            "document_type": "ALTER TABLE circulars ADD COLUMN document_type TEXT DEFAULT 'Original'",
+            "original_circular": "ALTER TABLE circulars ADD COLUMN original_circular TEXT",
+            "amendment_no": "ALTER TABLE circulars ADD COLUMN amendment_no INTEGER",
+            "amendment_reason": "ALTER TABLE circulars ADD COLUMN amendment_reason TEXT",
+        }
+
+        for column, statement in migrations.items():
+            if column not in existing:
+                con.execute(statement)
+
         con.commit()
 
 
@@ -66,8 +86,9 @@ def save_local_record(rec: dict[str, Any]) -> None:
             """
             INSERT INTO circulars (
                 circular_number, serial_no, date, subject, recipient, sender,
-                status, file_name, local_file_path, date_recorded, remarks, extracted_text
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                status, file_name, local_file_path, date_recorded, remarks, extracted_text,
+                document_type, original_circular, amendment_no, amendment_reason
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(circular_number) DO UPDATE SET
                 date=excluded.date,
                 subject=excluded.subject,
@@ -78,7 +99,11 @@ def save_local_record(rec: dict[str, Any]) -> None:
                 local_file_path=excluded.local_file_path,
                 date_recorded=excluded.date_recorded,
                 remarks=excluded.remarks,
-                extracted_text=excluded.extracted_text
+                extracted_text=excluded.extracted_text,
+                document_type=excluded.document_type,
+                original_circular=excluded.original_circular,
+                amendment_no=excluded.amendment_no,
+                amendment_reason=excluded.amendment_reason
             """,
             (
                 rec["circular_number"], rec.get("serial_no"), rec.get("date", ""),
@@ -86,6 +111,10 @@ def save_local_record(rec: dict[str, Any]) -> None:
                 rec.get("status", ""), rec.get("file_name", ""),
                 rec.get("local_file_path", ""), rec.get("date_recorded", ""),
                 rec.get("remarks", ""), rec.get("extracted_text", ""),
+                rec.get("document_type", "Original"),
+                rec.get("original_circular", ""),
+                rec.get("amendment_no"),
+                rec.get("amendment_reason", ""),
             ),
         )
         con.commit()
@@ -263,96 +292,162 @@ def clean_line(s: str) -> str:
 
 
 def parse_fields(text: str) -> dict[str, str]:
-    """Extract common EATTA circular fields from PDF/OCR text.
+    """Extract common EATTA circular fields from native PDF text or OCR.
 
-    Handles:
-    - To: All Members
-    - Multi-line member association recipient lists
-    - From: Secretariat
-    - Split-line labels produced by PDF extraction/OCR
+    More tolerant than the earlier parser:
+    - accepts labels with or without colons
+    - handles uppercase/lowercase labels
+    - handles split-line OCR layouts
+    - handles "All Members"
+    - detects RE / Subject lines even when OCR spacing is inconsistent
     """
-    lines = [clean_line(x) for x in text.splitlines() if clean_line(x)]
+    if not text:
+        return {"date": "", "subject": "", "to": "", "from": ""}
 
-    labels = {"to", "from", "copy to", "date", "re", "subject"}
+    raw_lines = [x.strip() for x in text.replace("\r", "\n").splitlines()]
+    lines = [clean_line(x) for x in raw_lines if clean_line(x)]
 
-    def labelled_value(label: str, max_follow: int = 1) -> str:
-        wanted = label.lower()
-        for i, line in enumerate(lines):
-            # Same-line form: From: Secretariat / Date: 26th August 2021
-            m = re.match(rf"(?i)^{re.escape(label)}\s*:\s*(.*)$", line)
-            if m:
-                first = clean_line(m.group(1))
-                if first:
-                    return first
+    # Normalize common OCR label variants.
+    label_re = re.compile(
+        r"(?i)^(to|from|copy\s*to|date|re|subject)\s*[:\-]?\s*(.*)$"
+    )
 
-                vals = []
-                for candidate in lines[i + 1 : i + 1 + max_follow]:
-                    low = candidate.lower().rstrip(":")
-                    if low in labels or re.match(
-                        r"(?i)^(To|From|Copy to|Date|RE|Subject)\s*:", candidate
-                    ):
-                        break
-                    vals.append(candidate)
-                return "; ".join(vals)
+    parsed_by_label: dict[str, list[str]] = {
+        "to": [],
+        "from": [],
+        "copy to": [],
+        "date": [],
+        "re": [],
+        "subject": [],
+    }
 
-            # Split-line form: "From" then "Secretariat"
-            if line.lower().rstrip(":") == wanted:
-                vals = []
-                for candidate in lines[i + 1 : i + 1 + max_follow]:
-                    low = candidate.lower().rstrip(":")
-                    if low in labels or re.match(
-                        r"(?i)^(To|From|Copy to|Date|RE|Subject)\s*:", candidate
-                    ):
-                        break
-                    vals.append(candidate)
-                return "; ".join(vals)
+    current_label = None
 
-        return ""
+    for line in lines:
+        m = label_re.match(line)
 
-    raw_date = labelled_value("Date", 1)
-    sender = labelled_value("From", 2)
-    subject = labelled_value("RE", 2) or labelled_value("Subject", 2)
+        if m:
+            label = re.sub(r"\s+", " ", m.group(1).lower()).strip()
+            value = clean_line(m.group(2))
 
-    # Recipient handling:
-    # 1. If the circular explicitly says "All Members", preserve that exact meaning.
-    # 2. Otherwise collect the multi-line To block until the next main label.
+            if label == "copyto":
+                label = "copy to"
+
+            current_label = label
+
+            if value:
+                parsed_by_label.setdefault(label, []).append(value)
+
+            continue
+
+        # Continue multi-line values only for fields that commonly span lines.
+        if current_label in {"to", "copy to"}:
+            # Stop if a new implicit field-like line appears.
+            if re.match(
+                r"(?i)^(from|date|re|subject|copy\s*to)\b",
+                line,
+            ):
+                current_label = None
+            else:
+                parsed_by_label[current_label].append(line)
+                continue
+
+        elif current_label in {"from", "date", "re", "subject"}:
+            # Allow one continuation line for OCR-split values.
+            if not parsed_by_label[current_label]:
+                parsed_by_label[current_label].append(line)
+            current_label = None
+
+    # ---------- TO ----------
     recipient = ""
 
+    # Strong explicit detection anywhere in the text.
     if re.search(r"(?i)\ball\s+members\b", text):
         recipient = "All Members"
     else:
-        for i, line in enumerate(lines):
-            m = re.match(r"(?i)^To\s*:\s*(.*)$", line)
+        to_parts = parsed_by_label.get("to", [])
+        if to_parts:
+            cleaned_parts = []
+            for part in to_parts:
+                part = clean_line(part)
+                if not part:
+                    continue
 
-            if m or line.lower().rstrip(":") == "to":
-                recipients = []
+                # Stop if OCR accidentally swallowed later labels into the To block.
+                if re.match(
+                    r"(?i)^(from|copy\s*to|date|re|subject)\b",
+                    part,
+                ):
+                    break
 
-                if m:
-                    first = clean_line(m.group(1))
-                    if first:
-                        if re.search(r"(?i)\ball\s+members\b", first):
-                            recipient = "All Members"
-                            break
-                        recipients.append(first)
+                cleaned_parts.append(part)
 
-                for candidate in lines[i + 1 : i + 10]:
-                    if re.match(
-                        r"(?i)^(From|Copy to|Date|RE|Subject)\s*:?(?:\s|$)",
-                        candidate,
-                    ):
-                        break
+            recipient = "; ".join(dict.fromkeys(cleaned_parts))
 
-                    if re.search(r"(?i)\ball\s+members\b", candidate):
-                        recipient = "All Members"
-                        break
+    # ---------- FROM ----------
+    sender_parts = parsed_by_label.get("from", [])
+    sender = clean_line(sender_parts[0]) if sender_parts else ""
 
-                    recipients.append(candidate)
+    # Common EATTA fallback.
+    if not sender and re.search(r"(?i)\bsecretariat\b", text):
+        # Only use this fallback when "Secretariat" appears near a From label.
+        m = re.search(
+            r"(?is)\bfrom\s*[:\-]?\s*(?:\n|\s)+([^\n]{1,80})",
+            text,
+        )
+        if m:
+            sender = clean_line(m.group(1))
 
-                if not recipient:
-                    recipient = "; ".join(
-                        dict.fromkeys(x for x in recipients if x)
-                    )
+    # ---------- DATE ----------
+    date_parts = parsed_by_label.get("date", [])
+    raw_date = clean_line(date_parts[0]) if date_parts else ""
+
+    if not raw_date:
+        # Detect common date patterns anywhere in OCR text.
+        date_patterns = [
+            r"\b\d{1,2}(?:st|nd|rd|th)?\s+[A-Za-z]+\s+\d{4}\b",
+            r"\b\d{1,2}[/-]\d{1,2}[/-]\d{4}\b",
+            r"\b\d{4}[/-]\d{1,2}[/-]\d{1,2}\b",
+        ]
+        for pattern in date_patterns:
+            m = re.search(pattern, text, flags=re.I)
+            if m:
+                raw_date = clean_line(m.group(0))
                 break
+
+    # ---------- SUBJECT / RE ----------
+    subject_parts = parsed_by_label.get("re", []) or parsed_by_label.get("subject", [])
+    subject = clean_line(" ".join(subject_parts)) if subject_parts else ""
+
+    if not subject:
+        # Try same-line OCR form: RE ... / SUBJECT ...
+        m = re.search(
+            r"(?im)^(?:re|subject)\s*[:\-]?\s+(.+)$",
+            text,
+        )
+        if m:
+            subject = clean_line(m.group(1))
+
+    if not subject:
+        # Fallback for uppercase title-style subject lines often used in circulars.
+        candidates = []
+        for line in lines:
+            letters = re.sub(r"[^A-Za-z]", "", line)
+            if len(letters) < 8:
+                continue
+
+            upper_letters = sum(1 for c in letters if c.isupper())
+            ratio = upper_letters / max(len(letters), 1)
+
+            if ratio >= 0.75 and len(line) <= 180:
+                if not re.match(
+                    r"(?i)^(east african tea trade association|circular to members|directors|to|from|date|copy to)$",
+                    line,
+                ):
+                    candidates.append(line)
+
+        if candidates:
+            subject = max(candidates, key=len)
 
     return {
         "date": raw_date,
@@ -360,7 +455,6 @@ def parse_fields(text: str) -> dict[str, str]:
         "to": recipient,
         "from": sender,
     }
-
 
 
 def parse_circular_date(value: str) -> date:
@@ -421,6 +515,38 @@ def parse_circular_date(value: str) -> date:
 def format_circular_date(value: date) -> str:
     """Store/display circular dates in standard DD/MM/YYYY format."""
     return value.strftime("%d/%m/%Y")
+
+
+def base_circular_number(number: str) -> str:
+    """Return original circular reference without /AMn suffix."""
+    return re.sub(r"/AM\d+$", "", str(number or "").strip(), flags=re.I)
+
+
+def available_original_circulars() -> list[str]:
+    """Return original circulars available for amendment selection."""
+    options: list[str] = []
+
+    try:
+        rows = api_call("list").get("records", [])
+        for row in rows:
+            number = str(row.get("circular_number", "")).strip()
+            document_type = str(row.get("document_type", "")).strip().lower()
+
+            if number and "/AM" not in number.upper() and document_type != "amendment":
+                options.append(number)
+    except Exception:
+        try:
+            df = local_records()
+            if "Circular Number" in df.columns:
+                for value in df["Circular Number"].tolist():
+                    number = str(value).strip()
+                    if number and "/AM" not in number.upper():
+                        options.append(number)
+        except Exception:
+            pass
+
+    return sorted(set(options), reverse=True)
+
 
 def uploaded_to_pdf(uploaded) -> bytes:
     data = uploaded.getvalue()
@@ -603,7 +729,7 @@ with st.sidebar:
 
     st.subheader("Circular numbering")
     st.caption("Automatic reference format")
-    st.code("EATTA/CIR/YYYY/001", language=None)
+    st.code("EATTA/CIR/YYYY/001\nEATTA/CIR/YYYY/001/AM1", language=None)
 
     st.subheader("Storage")
     st.caption("Numbered circular PDFs")
@@ -666,6 +792,38 @@ with create_tab:
                     f"{ocr_message} Check packages.txt and requirements.txt."
                 )
 
+        st.subheader("Document classification")
+        document_type = st.radio(
+            "Document type",
+            ["Original", "Amendment"],
+            horizontal=True,
+            help="Choose Amendment when this circular changes an earlier circular.",
+        )
+
+        original_circular = ""
+        amendment_reason = ""
+
+        if document_type == "Amendment":
+            original_options = available_original_circulars()
+
+            if original_options:
+                original_circular = st.selectbox(
+                    "Original circular being amended",
+                    options=original_options,
+                    help="The amendment reference will be generated as /AM1, /AM2, etc.",
+                )
+            else:
+                original_circular = st.text_input(
+                    "Original circular being amended",
+                    placeholder="EATTA/CIR/2026/001",
+                )
+
+            amendment_reason = st.text_area(
+                "Reason / summary of amendment",
+                placeholder="Briefly state what is being amended.",
+                height=80,
+            )
+
         c1, c2 = st.columns(2)
         with c1:
             detected_date = parse_circular_date(parsed.get("date", ""))
@@ -706,15 +864,46 @@ with create_tab:
                     st.error("Configure the Apps Script URL and shared secret first.")
                 else:
                     try:
-                        result = api_call("reserve", year=date.today().year)
+                        if document_type == "Amendment":
+                            if not original_circular:
+                                raise RuntimeError("Select or enter the original circular being amended.")
+
+                            result = api_call(
+                                "reserve_amendment",
+                                original_circular=base_circular_number(original_circular),
+                            )
+                        else:
+                            result = api_call(
+                                "reserve",
+                                year=selected_date.year,
+                            )
+
                         st.session_state.reserved_number = result["circular_number"]
-                        st.session_state.reserved_serial = int(result["serial_no"])
+                        st.session_state.reserved_serial = int(result.get("serial_no") or 0)
+                        st.session_state.reserved_document_type = document_type
+                        st.session_state.reserved_original_circular = result.get(
+                            "original_circular",
+                            base_circular_number(original_circular) if original_circular else "",
+                        )
+                        st.session_state.reserved_amendment_no = result.get("amendment_no")
+                        st.session_state.reserved_amendment_reason = amendment_reason
                         st.rerun()
                     except Exception as e:
                         st.error(f"Could not reserve serial: {e}")
         else:
             number = st.session_state.reserved_number
+            reserved_type = st.session_state.get("reserved_document_type", "Original")
+            reserved_original = st.session_state.get("reserved_original_circular", "")
+            reserved_am_no = st.session_state.get("reserved_amendment_no")
+            reserved_reason = st.session_state.get("reserved_amendment_reason", "")
+
             st.info(f"Reserved circular number: **{number}**")
+
+            if reserved_type == "Amendment":
+                st.caption(
+                    f"Amendment {reserved_am_no} to {reserved_original}"
+                    + (f" — {reserved_reason}" if reserved_reason else "")
+                )
 
             if st.button("2. Stamp, save PDF and update Google Sheet", type="primary", use_container_width=True):
                 try:
@@ -736,6 +925,10 @@ with create_tab:
                         "date_recorded": recorded_at,
                         "remarks": remarks,
                         "extracted_text": text,
+                        "document_type": reserved_type,
+                        "original_circular": reserved_original if reserved_type == "Amendment" else number,
+                        "amendment_no": reserved_am_no if reserved_type == "Amendment" else 0,
+                        "amendment_reason": reserved_reason if reserved_type == "Amendment" else "",
                     }
 
                     # Local backup first: the numbered PDF and metadata are never lost.
@@ -753,6 +946,10 @@ with create_tab:
                         file_name=saved_path.name,
                         local_file_path=str(saved_path),
                         remarks=remarks,
+                        document_type=reserved_type,
+                        original_circular=reserved_original if reserved_type == "Amendment" else number,
+                        amendment_no=reserved_am_no if reserved_type == "Amendment" else 0,
+                        amendment_reason=reserved_reason if reserved_type == "Amendment" else "",
                     )
 
                     st.success(f"Saved successfully as {number}")
@@ -763,8 +960,15 @@ with create_tab:
                         mime="application/pdf",
                         use_container_width=True,
                     )
-                    st.session_state.pop("reserved_number", None)
-                    st.session_state.pop("reserved_serial", None)
+                    for key in (
+                        "reserved_number",
+                        "reserved_serial",
+                        "reserved_document_type",
+                        "reserved_original_circular",
+                        "reserved_amendment_no",
+                        "reserved_amendment_reason",
+                    ):
+                        st.session_state.pop(key, None)
                 except Exception as e:
                     st.error(f"Save failed: {e}")
                     st.warning("If a serial was already reserved, it remains reserved and will not be reused. This protects the audit trail.")
@@ -786,7 +990,11 @@ with register_tab:
                     "date": "Date", "subject": "Subject", "to": "To", "from": "From",
                     "status": "Status", "file_name": "File Name",
                     "local_file_path": "Local File Path", "date_recorded": "Date Recorded",
-                    "remarks": "Remarks"
+                    "remarks": "Remarks",
+                    "document_type": "Document Type",
+                    "original_circular": "Original Circular",
+                    "amendment_no": "Amendment No.",
+                    "amendment_reason": "Amendment Reason",
                 })
         except Exception as e:
             st.error(f"Could not load Google Sheet: {e}")
@@ -803,6 +1011,49 @@ with register_tab:
             mask = shown.astype(str).apply(lambda col: col.str.contains(search, case=False, na=False)).any(axis=1)
             shown = shown[mask]
         st.dataframe(shown, use_container_width=True, hide_index=True)
+
+        st.subheader("Amendment trace")
+        originals = sorted(
+            {
+                base_circular_number(v)
+                for v in shown["Circular Number"].astype(str).tolist()
+                if str(v).strip()
+            },
+            reverse=True,
+        )
+
+        if originals:
+            trace_base = st.selectbox(
+                "Select circular to trace",
+                originals,
+                key="trace_base_circular",
+            )
+
+            trace = shown[
+                shown["Circular Number"]
+                .astype(str)
+                .str.startswith(trace_base, na=False)
+            ].copy()
+
+            trace_columns = [
+                c for c in [
+                    "Circular Number",
+                    "Document Type",
+                    "Amendment No.",
+                    "Date",
+                    "Subject",
+                    "Amendment Reason",
+                    "Status",
+                ]
+                if c in trace.columns
+            ]
+
+            if trace_columns:
+                st.dataframe(
+                    trace[trace_columns],
+                    use_container_width=True,
+                    hide_index=True,
+                )
 
         if EXCEL_PATH.exists():
             st.download_button(
