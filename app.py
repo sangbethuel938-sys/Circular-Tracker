@@ -1223,22 +1223,51 @@ with register_tab:
     st.subheader("Circular Register")
     source = st.radio("View records from", ["Google Sheets", "Local backup"], horizontal=True)
 
+    amendment_df = pd.DataFrame()
+
     if source == "Google Sheets" and configured:
         try:
             data = api_call("list").get("records", [])
             df = pd.DataFrame(data)
+
             if not df.empty:
                 df = df.rename(columns={
-                    "serial_no": "Serial No.", "circular_number": "Circular Number",
-                    "date": "Date", "subject": "Subject", "to": "To", "from": "From",
-                    "status": "Status", "file_name": "File Name",
-                    "local_file_path": "Local File Path", "date_recorded": "Date Recorded",
-                    "remarks": "Remarks",
-                    "document_type": "Document Type",
+                    "serial_no": "Serial No.",
                     "original_circular": "Original Circular",
-                    "amendment_no": "Amendment No.",
+                    "current_reference": "Current Reference",
+                    "date": "Date",
+                    "subject": "Subject",
+                    "to": "To",
+                    "from": "From",
+                    "status": "Status",
+                    "file_name": "File Name",
+                    "local_file_path": "Local File Path",
+                    "date_recorded": "Date Recorded",
+                    "remarks": "Remarks",
+                    "latest_amendment": "Latest Amendment",
                     "amendment_reason": "Amendment Reason",
                 })
+
+            amendment_data = api_call("list_amendments").get("records", [])
+            amendment_df = pd.DataFrame(amendment_data)
+
+            if not amendment_df.empty:
+                amendment_df = amendment_df.rename(columns={
+                    "original_circular": "Original Circular",
+                    "amendment_reference": "Amendment Reference",
+                    "amendment_no": "Amendment No.",
+                    "date": "Date",
+                    "subject": "Subject",
+                    "to": "To",
+                    "from": "From",
+                    "status": "Status",
+                    "file_name": "File Name",
+                    "local_file_path": "Local File Path",
+                    "date_recorded": "Date Recorded",
+                    "amendment_reason": "Amendment Reason",
+                    "remarks": "Remarks",
+                })
+
         except Exception as e:
             st.error(f"Could not load Google Sheet: {e}")
             df = local_records()
@@ -1248,52 +1277,70 @@ with register_tab:
     if df.empty:
         st.info("No circulars recorded yet.")
     else:
-        search = st.text_input("Search register", placeholder="Circular number, subject, recipient...")
-        shown = df.copy()
-        if search:
-            mask = shown.astype(str).apply(lambda col: col.str.contains(search, case=False, na=False)).any(axis=1)
-            shown = shown[mask]
-        st.dataframe(shown, use_container_width=True, hide_index=True)
-
-        st.subheader("Amendment trace")
-        originals = sorted(
-            {
-                base_circular_number(v)
-                for v in shown["Circular Number"].astype(str).tolist()
-                if str(v).strip()
-            },
-            reverse=True,
+        search = st.text_input(
+            "Search register",
+            placeholder="Circular number, subject, recipient...",
         )
 
-        if originals:
-            trace_base = st.selectbox(
-                "Select circular to trace",
-                originals,
-                key="trace_base_circular",
+        shown = df.copy()
+
+        if search:
+            mask = (
+                shown.astype(str)
+                .apply(
+                    lambda col: col.str.contains(
+                        search,
+                        case=False,
+                        na=False,
+                    )
+                )
+                .any(axis=1)
+            )
+            shown = shown[mask]
+
+        st.dataframe(
+            shown,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        if not amendment_df.empty and "Original Circular" in amendment_df.columns:
+            st.subheader("Amendment trace")
+
+            originals = sorted(
+                amendment_df["Original Circular"]
+                .dropna()
+                .astype(str)
+                .unique()
+                .tolist(),
+                reverse=True,
             )
 
-            trace = shown[
-                shown["Circular Number"]
-                .astype(str)
-                .str.startswith(trace_base, na=False)
-            ].copy()
+            if originals:
+                trace_base = st.selectbox(
+                    "Select circular to trace",
+                    originals,
+                    key="trace_base_circular",
+                )
 
-            trace_columns = [
-                c for c in [
-                    "Circular Number",
-                    "Document Type",
-                    "Amendment No.",
-                    "Date",
-                    "Subject",
-                    "Amendment Reason",
-                    "Status",
+                trace = amendment_df[
+                    amendment_df["Original Circular"].astype(str) == trace_base
+                ].copy()
+
+                trace_cols = [
+                    c for c in [
+                        "Amendment Reference",
+                        "Amendment No.",
+                        "Date",
+                        "Subject",
+                        "Amendment Reason",
+                        "Status",
+                    ]
+                    if c in trace.columns
                 ]
-                if c in trace.columns
-            ]
 
-            if trace_columns:
                 st.dataframe(
-                    trace[trace_columns],
+                    trace[trace_cols],
                     use_container_width=True,
                     hide_index=True,
                 )
